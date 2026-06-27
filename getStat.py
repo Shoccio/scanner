@@ -53,12 +53,19 @@ def generate_statistics(
             }
         )
 
-        for question_index, (_, is_correct) in enumerate(result["Answers"], start=1):
-            question_correct_counts.setdefault(question_index, 0)
-            question_students.setdefault(question_index, [])
+        for question_index, answer_entry in enumerate(result["Answers"], start=1):
+            if isinstance(answer_entry, (list, tuple)) and len(answer_entry) >= 3:
+                question_number = answer_entry[0]
+                is_correct = answer_entry[2]
+            else:
+                question_number = question_index
+                is_correct = answer_entry[1] if isinstance(answer_entry, (list, tuple)) and len(answer_entry) >= 2 else False
+
+            question_correct_counts.setdefault(question_number, 0)
+            question_students.setdefault(question_number, [])
             if is_correct:
-                question_correct_counts[question_index] += 1
-                question_students[question_index].append(result["Student"])
+                question_correct_counts[question_number] += 1
+                question_students[question_number].append(result["Student"])
 
     answer_key = getStudents.load_answer_key()
     total_questions = len(answer_key)

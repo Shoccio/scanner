@@ -85,7 +85,7 @@ def scan_students(students_root: str, debug: bool = False) -> list[dict[str, Any
                     "Student": student_name,
                     "Image": image_path,
                     "Score": f"{correct}/{total}",
-                    "Answers": [(student_letter, is_correct) for _, student_letter, is_correct in details],
+                    "Answers": [[question_number, student_letter, is_correct] for question_number, student_letter, is_correct in details],
                 }
             )
     return entries
