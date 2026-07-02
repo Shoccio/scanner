@@ -7,14 +7,30 @@ import numpy as np
 
 # Ignore area thresholds for candidate detection.
 # Tune these values to exclude regions outside the answer bubble columns.
-LEFT_IGNORE_X = 270
-RIGHT_IGNORE_X = 900
-TOP_IGNORE_Y = 1100
-BOTTOM_IGNORE_Y = 3575
+TOP_IGNORE_Y = 800
+BOTTOM_IGNORE_Y = 3000
+
+# Four-column sheet layout tuning.
+# Adjust these pixel coordinates to match the physical column layout on the paper.
+COLUMN_SPLIT_X = (530, 1100, 1700)
+# Adjust the ignore x-coordinate per column to skip left-side margins or noise.
+COLUMN_IGNORE_X = (180, 680, 1360, 1850)
+QUESTIONS_PER_COLUMN = 25
 
 # Blank detection threshold based on mean intensity range across one question's bubbles.
 # If the mean intensity difference is small, the question is likely unshaded.
 BLANK_MEAN_INTENSITY_RANGE = 15.0
+
+# Bubble candidate tuning for darker marks that spill slightly over the bubble outline.
+# Slightly tighter preset while still allowing a little spill-over.
+BUBBLE_MIN_AREA = 30
+BUBBLE_MAX_AREA_RATIO = 0.15
+BUBBLE_MIN_SIZE = 8
+BUBBLE_MAX_SIZE_RATIO = 0.40
+BUBBLE_RATIO_RANGE = (0.30, 3.2)
+BUBBLE_CIRCULARITY_RANGE = (0.14, 1.6)
+BUBBLE_ELLIPSE_FIT_TOLERANCE = 0.90
+BUBBLE_AXIS_RATIO_LIMIT = 2.6
 
 
 def preprocess_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -83,40 +99,42 @@ def detect_sheet_mask(image: np.ndarray) -> np.ndarray:
     return np.ones(gray.shape, dtype=np.uint8) * 255
 
 
-def find_candidate_bubbles(
-    binary: np.ndarray,
-    left_x_cut: int | None = None,
-    right_x_cut: int | None = None,
-    column_divider: int | None = None,
-) -> list[tuple[int, int, int, int, np.ndarray]]:
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def get_column_index(center_x: float) -> int:
+    for column_index, threshold in enumerate(COLUMN_SPLIT_X):
+        if center_x < threshold:
+            return column_index
+    return len(COLUMN_SPLIT_X)
+
+
+def find_candidate_bubbles(binary: np.ndarray) -> list[tuple[int, int, int, int, np.ndarray]]:
+    detection_binary = binary.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    detection_binary = cv2.dilate(detection_binary, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(detection_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     h, w = binary.shape
     candidates = []
+    image_width = w
 
     for contour in contours:
         x, y, cw, ch = cv2.boundingRect(contour)
         if y < TOP_IGNORE_Y or y + ch > BOTTOM_IGNORE_Y:
             continue
         center_x = x + cw / 2.0
-        if column_divider is not None:
-            #Ignore area for the X Axis-------------------------------------------
-            left_min_x = LEFT_IGNORE_X
-            right_min_x = RIGHT_IGNORE_X
-            if center_x < column_divider:
-                if x < left_min_x:
-                    continue
-            else:
-                if x < right_min_x:
-                    continue
-        area = cv2.contourArea(contour)
-        if area < 80 or area > h * w * 0.08:
+        column_index = get_column_index(center_x)
+        ignore_threshold = COLUMN_IGNORE_X[column_index]
+        if x < ignore_threshold:
             continue
 
-        if cw < 14 or ch < 14 or cw > w * 0.30 or ch > h * 0.30:
+        area = cv2.contourArea(contour)
+        if area < BUBBLE_MIN_AREA or area > h * w * BUBBLE_MAX_AREA_RATIO:
+            continue
+
+        if cw < BUBBLE_MIN_SIZE or ch < BUBBLE_MIN_SIZE or cw > w * BUBBLE_MAX_SIZE_RATIO or ch > h * BUBBLE_MAX_SIZE_RATIO:
             continue
 
         ratio = cw / float(ch)
-        if ratio < 0.5 or ratio > 2.0:
+        if ratio < BUBBLE_RATIO_RANGE[0] or ratio > BUBBLE_RATIO_RANGE[1]:
             continue
 
         perimeter = cv2.arcLength(contour, True)
@@ -124,7 +142,7 @@ def find_candidate_bubbles(
             continue
 
         circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-        if circularity < 0.30 or circularity > 1.3:
+        if circularity < BUBBLE_CIRCULARITY_RANGE[0] or circularity > BUBBLE_CIRCULARITY_RANGE[1]:
             continue
 
         if len(contour) >= 5:
@@ -134,10 +152,10 @@ def find_candidate_bubbles(
                 if minor <= 0 or major <= 0:
                     continue
                 axis_ratio = max(major, minor) / min(major, minor)
-                if axis_ratio > 2.0:
+                if axis_ratio > BUBBLE_AXIS_RATIO_LIMIT:
                     continue
                 ellipse_area = np.pi * (major / 2.0) * (minor / 2.0)
-                if abs(area - ellipse_area) / max(ellipse_area, 1.0) > 0.70:
+                if abs(area - ellipse_area) / max(ellipse_area, 1.0) > BUBBLE_ELLIPSE_FIT_TOLERANCE:
                     continue
             except cv2.error:
                 pass
@@ -161,7 +179,7 @@ def group_contours_by_rows(candidates: list[tuple[int, int, int, int, np.ndarray
 
     for x, y, cw, ch, contour in candidates[1:]:
         center_y = y + ch / 2.0
-        threshold = max(row_height * 1.0, 24)
+        threshold = max(row_height * 0.70, 18)
         if abs(center_y - row_center_y) > threshold:
             rows.append(current_row)
             current_row = [(x, y, cw, ch, contour)]
@@ -188,21 +206,21 @@ def split_row_into_groups(row: list[tuple[int, int, int, int, np.ndarray]]) -> l
 
     widths = [cw for _, _, cw, _, _ in row]
     avg_width = float(np.median(widths))
-    gap_threshold = max(avg_width * 0.9, 16)
+    gap_threshold = max(avg_width * 0.7, 12)
 
     groups: list[list[tuple[int, int, int, int, np.ndarray]]] = []
     for start in range(len(row) - 3):
         group = row[start : start + 4]
         gaps = [group[i + 1][0] - (group[i][0] + group[i][2]) for i in range(3)]
-        if any(gap > gap_threshold * 2 for gap in gaps):
+        if any(gap > gap_threshold * 2.2 for gap in gaps):
             continue
 
         heights = [h for _, _, _, h, _ in group]
-        if max(heights) - min(heights) > max(6, np.median(heights) * 0.4):
+        if max(heights) - min(heights) > max(8, np.median(heights) * 0.45):
             continue
 
         total_width = (group[-1][0] + group[-1][2]) - group[0][0]
-        if total_width > avg_width * 10:
+        if total_width > avg_width * 7.5:
             continue
 
         groups.append(group)
@@ -221,8 +239,9 @@ def get_question_clusters(
     rows: list[list[tuple[int, int, int, int, np.ndarray]]],
     image_width: int,
 ) -> list[tuple[int, list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]]:
-    left_groups: list[tuple[list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]] = []
-    right_groups: list[tuple[list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]] = []
+    column_groups: list[list[tuple[list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]]] = [
+        [] for _ in range(len(COLUMN_SPLIT_X) + 1)
+    ]
 
     for row in rows:
         groups = split_row_into_groups(row)
@@ -236,50 +255,18 @@ def get_question_clusters(
             x1 = max(x + cw for x, _, cw, _, _ in group)
             y1 = max(y + ch for _, y, _, ch, _ in group)
             center_x = (x0 + x1) / 2.0
-            if center_x < image_width * 0.5:
-                left_groups.append((group, (x0, y0, x1, y1)))
-            else:
-                right_groups.append((group, (x0, y0, x1, y1)))
-
-    left_groups.sort(key=lambda item: (item[1][1], item[1][0]))
-    right_groups.sort(key=lambda item: (item[1][1], item[1][0]))
+            column_index = get_column_index(center_x)
+            column_groups[column_index].append((group, (x0, y0, x1, y1)))
 
     clusters: list[tuple[int, list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]] = []
-    question_number = 1
-    for group, bbox in left_groups:
-        clusters.append((question_number, group, bbox))
-        question_number += 1
-
-    question_number = 21
-    for group, bbox in right_groups:
-        clusters.append((question_number, group, bbox))
-        question_number += 1
+    for column_index, groups in enumerate(column_groups):
+        groups.sort(key=lambda item: (item[1][1], item[1][0]))
+        question_number = column_index * QUESTIONS_PER_COLUMN + 1
+        for group, bbox in groups:
+            clusters.append((question_number, group, bbox))
+            question_number += 1
 
     return clusters
-
-
-def compute_column_cutoffs(
-    clusters: list[tuple[int, list[tuple[int, int, int, int, np.ndarray]], tuple[int, int, int, int]]],
-    image_width: int,
-) -> tuple[int | None, int | None, int]:
-    left_x0 = [x0 for question_number, _, (x0, _, _, _) in clusters if question_number <= 20]
-    right_x0 = [x0 for question_number, _, (x0, _, _, _) in clusters if question_number > 20]
-
-    left_cut = int(round(np.mean(left_x0))) - 60 if left_x0 else None
-    right_cut = int(round(np.mean(right_x0))) - 60 if right_x0 else None
-    if left_cut is not None:
-        left_cut = max(0, left_cut)
-    if right_cut is not None:
-        right_cut = max(0, right_cut)
-
-    left_centers = [x0 + (x1 - x0) / 2.0 for question_number, _, (x0, _, x1, _) in clusters if question_number <= 20]
-    right_centers = [x0 + (x1 - x0) / 2.0 for question_number, _, (x0, _, x1, _) in clusters if question_number > 20]
-    if left_centers and right_centers:
-        divider = int(round((np.mean(left_centers) + np.mean(right_centers)) / 2.0))
-    else:
-        divider = image_width // 2
-
-    return left_cut, right_cut, divider
 
 
 def build_answer_grid(
@@ -405,11 +392,6 @@ def extract_answers(image_path: str, debug: bool = False) -> list[tuple[int, str
     candidates = find_candidate_bubbles(binary_image)
     rows = group_contours_by_rows(candidates)
     clusters = get_question_clusters(rows, image.shape[1])
-    left_cut, right_cut, divider = compute_column_cutoffs(clusters, image.shape[1])
-    if left_cut is not None or right_cut is not None:
-        candidates = find_candidate_bubbles(binary_image, left_cut, right_cut, divider)
-        rows = group_contours_by_rows(candidates)
-        clusters = get_question_clusters(rows, image.shape[1])
 
     if debug:
         debug_dir = os.path.join(os.path.dirname(image_path), "debug_questions")
